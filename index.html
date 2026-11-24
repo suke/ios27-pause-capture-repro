@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pause during capture repro</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fff; --fg: #111; --sub: #666; --line: #ccc; --ok: #137a3a; --bad: #c0261c; --accent: #0a66d8; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111; --fg: #eee; --sub: #999; --line: #333; --ok: #4cd07d; --bad: #ff6b5e; --accent: #5aa2ff; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px 16px 32px; background: var(--bg); color: var(--fg); font: 15px/1.5 -apple-system, system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  ol { margin: 0 0 12px; padding-left: 20px; color: var(--sub); font-size: 14px; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+  button { font-size: 16px; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--fg); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .4; }
+  video { width: 100%; max-width: 320px; background: #000; border-radius: 8px; display: block; }
+  #indicators { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 12px 0; font-variant-numeric: tabular-nums; }
+  #indicators dt { color: var(--sub); }
+  #indicators dd { margin: 0; font-weight: 600; }
+  .ok { color: var(--ok); }
+  .bad { color: var(--bad); }
+  pre { white-space: pre-wrap; word-break: break-all; font: 12px/1.4 ui-monospace, Menlo, monospace; border: 1px solid var(--line); border-radius: 8px; padding: 8px; max-height: 40vh; overflow: auto; margin: 0; }
+</style>
+</head>
+<body>
+<h1>Microphone stops after pause() during capture</h1>
+<ol>
+  <li>Tap <b>Start</b> and allow microphone access.</li>
+  <li>Keep speaking and tap <b>Toggle mute</b> three times. The first unmute can recover.</li>
+  <li>Wait 45 seconds.</li>
+</ol>
+<p><b>Expected:</b> <b>Microphone</b> stays <code>capturing and sending</code>.<br>
+<b>Actual (iOS 27.2.1):</b> <b>Microphone</b> shows <code>STALLED</code>, then <b>Microphone track</b> shows <code>readyState=ended</code>.</p>
+
+<div class="buttons">
+  <button class="primary" id="start">Start</button>
+  <button id="toggle" disabled>Toggle mute</button>
+  <button id="copy">Copy log</button>
+</div>
+
+<video id="video" muted playsinline></video>
+
+<dl id="indicators">
+  <dt>Video</dt><dd id="videoState">–</dd>
+  <dt>Microphone</dt><dd id="micState">–</dd>
+  <dt>Microphone track</dt><dd id="trackState">–</dd>
+  <dt>Since last toggle</dt><dd id="sinceToggle">–</dd>
+</dl>
+
+<pre id="log"></pre>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const t0 = performance.now();
+let lastToggle = null;
+let micTrack = null;
+
+function log(message) {
+    const line = `${new Date().toISOString().slice(11, 23)} +${((performance.now() - t0) / 1000).toFixed(2)}s ${message}`;
+    $('log').textContent += line + '\n';
+    $('log').scrollTop = $('log').scrollHeight;
+    console.log(line);
+}
+
+function canvasVideoTrack() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 320;
+    canvas.height = 180;
+    const context = canvas.getContext('2d');
+    setInterval(() => {
+        context.fillStyle = '#123';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.fillStyle = '#fff';
+        context.font = '28px sans-serif';
+        context.fillText(new Date().toISOString().slice(11, 22), 20, 100);
+    }, 100);
+    return canvas.captureStream(10).getVideoTracks()[0];
+}
+
+function watchStats(pc) {
+    let previous = {};
+    let stalledSince = null;
+    setInterval(async () => {
+        const report = await pc.getStats();
+        let source, outbound;
+        report.forEach((stat) => {
+            if (stat.type === 'media-source' && stat.kind === 'audio')
+                source = stat;
+            if (stat.type === 'outbound-rtp' && stat.kind === 'audio')
+                outbound = stat;
+        });
+        const duration = source?.totalSamplesDuration;
+        const packets = outbound?.packetsSent;
+        // The first sample has nothing to compare with, so it is not judged.
+        const firstSample = previous.duration === undefined;
+        const captured = duration > previous.duration;
+        const sent = packets > previous.packets;
+        previous = { duration, packets };
+
+        if (micTrack?.readyState === 'ended') {
+            $('micState').textContent = 'track ended';
+            $('micState').className = 'bad';
+        } else if (firstSample) {
+            // Wait for the next sample.
+        } else if (captured && sent) {
+            if (stalledSince !== null)
+                log(`microphone resumed after ${((performance.now() - stalledSince) / 1000).toFixed(1)}s`);
+            stalledSince = null;
+            $('micState').textContent = 'capturing and sending';
+            $('micState').className = 'ok';
+        } else {
+            if (stalledSince === null) {
+                stalledSince = performance.now();
+                log(`microphone STALLED (captured=${captured}, sent=${sent})`);
+            }
+            $('micState').textContent = `STALLED for ${((performance.now() - stalledSince) / 1000).toFixed(1)}s`;
+            $('micState').className = 'bad';
+        }
+
+        const video = $('video');
+        $('videoState').textContent = `paused=${video.paused} muted=${video.muted}`;
+        $('trackState').textContent = micTrack ? `readyState=${micTrack.readyState} muted=${micTrack.muted}` : '–';
+        $('trackState').className = micTrack?.readyState === 'ended' ? 'bad' : '';
+        $('sinceToggle').textContent = lastToggle === null ? '–' : `${((performance.now() - lastToggle) / 1000).toFixed(1)}s`;
+    }, 500);
+}
+
+async function start() {
+    $('start').disabled = true;
+    const localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true } });
+    micTrack = localStream.getAudioTracks()[0];
+    log(`getUserMedia ok, settings=${JSON.stringify(micTrack.getSettings())}`);
+    micTrack.addEventListener('ended', () => log('microphone track ENDED'));
+
+    // The "remote" side sends a clone of the microphone back, so that no WebAudio context is involved.
+    const remoteMedia = new MediaStream([micTrack.clone(), canvasVideoTrack()]);
+
+    const pcLocal = new RTCPeerConnection();
+    const pcRemote = new RTCPeerConnection();
+    pcLocal.onicecandidate = (event) => event.candidate && pcRemote.addIceCandidate(event.candidate);
+    pcRemote.onicecandidate = (event) => event.candidate && pcLocal.addIceCandidate(event.candidate);
+    pcLocal.onconnectionstatechange = () => log(`connectionState=${pcLocal.connectionState}`);
+
+    const receivedStream = new MediaStream();
+    pcLocal.ontrack = (event) => receivedStream.addTrack(event.track);
+
+    pcLocal.addTrack(micTrack, localStream);
+    pcLocal.addTransceiver('video', { direction: 'recvonly' });
+    await pcLocal.setLocalDescription(await pcLocal.createOffer());
+    await pcRemote.setRemoteDescription(pcLocal.localDescription);
+    for (const track of remoteMedia.getTracks())
+        pcRemote.addTrack(track, remoteMedia);
+    await pcRemote.setLocalDescription(await pcRemote.createAnswer());
+    await pcLocal.setRemoteDescription(pcRemote.localDescription);
+
+    const video = $('video');
+    video.srcObject = receivedStream;
+    await video.play();
+    log(`video.play() resolved, muted=${video.muted}`);
+    watchStats(pcLocal);
+    $('toggle').disabled = false;
+}
+
+// Same sequence as the web app where this was first seen: pause(), flip muted, then play() from setTimeout(0).
+function toggleMute() {
+    const video = $('video');
+    lastToggle = performance.now();
+    video.pause();
+    video.muted = !video.muted;
+    log(`pause() + muted=${video.muted}`);
+    setTimeout(() => video.play().then(() => log('play() resolved'), (error) => log(`play() rejected: ${error.name}`)), 0);
+}
+
+$('start').onclick = () => start().catch((error) => {
+    log(`ERROR ${error.name}: ${error.message}`);
+    $('start').disabled = false;
+});
+$('toggle').onclick = toggleMute;
+$('copy').onclick = () => navigator.clipboard.writeText($('log').textContent).then(() => log('log copied'));
+</script>
+</body>
+</html>
